@@ -4,17 +4,17 @@ from functools import wraps
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# ================= APP =================
 app = Flask(__name__)
-
-# ================== SECURITY ==================
-app.secret_key = "x8Q@92LkP#E!4zM7$A^fW3R&dT5J"  # strong secret
+app.secret_key = "x8Q@92LkP#E!4zM7$A^fW3R&dT5J"
 
 APP_USERNAME = "Admin"
 APP_PASSWORD = "Aezakmi"
 
-AUTO_PROTECT_INTERVAL = 300  # 5 minutes
+AUTO_PROTECT_INTERVAL = 300  # 5 min
+RETRY_LIMIT = 3
 
-# ================== STATE ==================
+# ================= STATE =================
 class AppState:
     def __init__(self):
         self.is_running = False
@@ -33,15 +33,16 @@ class AppState:
 state = AppState()
 lock = threading.RLock()
 
-# ================== HELPERS ==================
+# ================= HELPERS =================
 def add_log(msg):
     with lock:
         state.log.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-        if len(state.log) > 30:
+        if len(state.log) > 40:
             state.log.pop(0)
 
 def extract_vouchers(text):
-    return list(dict.fromkeys(re.findall(r"[A-Z0-9]{4,30}", text.upper())))
+    found = re.findall(r"[A-Z0-9]{4,30}", text.upper())
+    return list(dict.fromkeys(found))
 
 def extract_cookies(text):
     if "cookie:" in text.lower():
@@ -59,34 +60,72 @@ def make_headers(cookie):
         "Cookie": cookie
     }
 
+# ================= CHECK LOGIC =================
 def check_single_voucher(session_http, code, headers):
     url = "https://www.sheinindia.in/api/cart/apply-voucher"
     reset_url = "https://www.sheinindia.in/api/cart/reset-voucher"
     payload = {"voucherId": code, "device": {"client_type": "web"}}
 
-    try:
-        r = session_http.post(url, json=payload, headers=headers, timeout=15, verify=False)
+    for attempt in range(RETRY_LIMIT):
+        try:
+            r = session_http.post(url, json=payload, headers=headers, timeout=15, verify=False)
 
-        if r.status_code in (403, 429):
-            return False, "Blocked / Cloudflare", 0
+            if r.status_code in (403, 429):
+                return False, "BLOCKED / RATE LIMIT", 0
 
-        if r.status_code != 200:
-            return False, f"HTTP {r.status_code}", 0
+            if r.status_code == 400:
+                try:
+                    data = r.json()
+                    msg = data.get("error", {}).get("message") or data.get("message") or "INVALID"
+                    return False, msg, 0
+                except:
+                    return False, "INVALID (400)", 0
 
-        data = r.json()
+            if r.status_code != 200:
+                if attempt < RETRY_LIMIT-1:
+                    time.sleep(2)
+                    continue
+                return False, f"HTTP {r.status_code}", 0
 
-        for v in data.get("appliedVouchers", []):
-            if v.get("code") == code:
-                val = v.get("appliedValue", {}).get("value", 0)
-                session_http.post(reset_url, json={"voucherId": code}, headers=headers, timeout=10, verify=False)
-                return True, "VALID", val
+            data = r.json()
+            discount = 0
+            applied = False
 
-        return False, "INVALID", 0
+            # appliedVouchers
+            for v in data.get("appliedVouchers", []):
+                if v.get("code") == code:
+                    discount = v.get("appliedValue", {}).get("value", 0)
+                    applied = True
+                    break
 
-    except Exception as e:
-        return False, str(e), 0
+            # entries fallback
+            if not applied:
+                for entry in data.get("entries", []):
+                    v_amt = entry.get("totalVoucherAmount", {}).get("value", 0)
+                    promo = entry.get("voucherPromoAmt", 0)
+                    if v_amt > 0 or promo > 0:
+                        discount = max(v_amt, promo)
+                        applied = True
+                        break
 
-# ================== WORKER ==================
+            if applied:
+                try:
+                    session_http.post(reset_url, json={"voucherId": code}, headers=headers, timeout=10, verify=False)
+                except:
+                    pass
+                return True, "VALID", discount
+
+            return False, data.get("message","NOT APPLIED"), 0
+
+        except Exception as e:
+            if attempt < RETRY_LIMIT-1:
+                time.sleep(2)
+                continue
+            return False, str(e), 0
+
+    return False, "FAILED", 0
+
+# ================= WORKER =================
 def worker_loop():
     while not state.stop_requested:
         session_http = requests.Session()
@@ -119,7 +158,7 @@ def worker_loop():
 
         with lock:
             state.status = "Sleeping (Auto Protect Mode)"
-            add_log("Auto Protect: Waiting next cycle")
+            add_log("Auto Protect: Next cycle waiting")
 
         for _ in range(AUTO_PROTECT_INTERVAL):
             if state.stop_requested:
@@ -130,7 +169,7 @@ def worker_loop():
         state.is_running = False
         state.status = "Stopped"
 
-# ================== AUTH ==================
+# ================= AUTH =================
 def login_required(fn):
     @wraps(fn)
     def wrapper(*a, **k):
@@ -160,7 +199,7 @@ def logout():
     session.clear()
     return redirect("/login")
 
-# ================== ROUTES ==================
+# ================= ROUTES =================
 @app.route("/")
 @login_required
 def index():
@@ -207,46 +246,62 @@ def status():
             "checked": state.checked,
             "valid": state.valid,
             "invalid": state.invalid,
-            "valid_results": state.valid_results[:20],
-            "invalid_results": state.invalid_results[:20],
-            "log": state.log[-10:]
+            "valid_results": state.valid_results[:50],
+            "invalid_results": state.invalid_results[:50],
+            "log": state.log[-15:]
         })
 
-# ================== PREMIUM UI ==================
+# ================= UI =================
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Premium Checker</title>
+<title>Ultimate Coupon Checker</title>
 <style>
 body{background:#0f172a;color:white;font-family:sans-serif}
-.card{background:#1e293b;padding:20px;border-radius:12px;width:600px;margin:auto}
+.card{background:#1e293b;padding:20px;border-radius:12px;width:800px;margin:auto}
 textarea{width:100%;height:80px}
 button{padding:10px 15px;margin:5px}
-pre{background:black;padding:10px;height:200px;overflow:auto}
+pre{background:black;padding:10px;height:150px;overflow:auto}
+.flex{display:flex;gap:10px}
+.box{width:50%;background:#111827;padding:10px;border-radius:8px}
 </style>
 </head>
 <body>
 <div class=card>
-<h2>Premium Coupon Checker</h2>
+<h2>Ultimate Coupon Checker</h2>
 <button onclick="logout()">Logout</button><br><br>
-<textarea id=cookies placeholder="Cookies"></textarea>
-<textarea id=vouchers placeholder="Vouchers"></textarea><br>
+<textarea id=cookies placeholder="Paste Cookies"></textarea>
+<textarea id=vouchers placeholder="Paste Coupon List"></textarea><br>
 <label><input type=checkbox id=auto> Auto Protect Mode</label><br><br>
-<button onclick=start()>Start</button>
-<button onclick=stop()>Stop</button>
-<pre id=out></pre>
+<button onclick=startCheck()>Start</button>
+<button onclick=stopCheck()>Stop</button>
+
+<h3>Status</h3>
+<pre id=statusBox></pre>
+
+<div class=flex>
+<div class=box>
+<h3>✅ Valid Coupons</h3>
+<pre id=validBox></pre>
+</div>
+<div class=box>
+<h3>❌ Invalid / Expired</h3>
+<pre id=invalidBox></pre>
+</div>
 </div>
 <script>
 function logout(){location='/logout'}
-function start(){
+function startCheck(){
 fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},
 body:JSON.stringify({cookies:cookies.value,vouchers:vouchers.value,auto_protect:auto.checked})})
 }
-function stop(){fetch('/stop',{method:'POST'})}
+function stopCheck(){fetch('/stop',{method:'POST'})}
 setInterval(()=>{
 fetch('/status').then(r=>r.json()).then(d=>{
-out.textContent=JSON.stringify(d,null,2)
+statusBox.textContent = JSON.stringify(d,null,2)
+validBox.textContent = d.valid_results.map(x=>x.code+" => ₹"+x.discount).join("\\n")
+invalidBox.textContent = d.invalid_results.map(x=>x.code+" => "+x.msg).join("\\n")
 })
 },2000)
 </script>
@@ -254,7 +309,7 @@ out.textContent=JSON.stringify(d,null,2)
 </html>
 """
 
-# ================== MAIN ==================
+# ================= MAIN =================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
