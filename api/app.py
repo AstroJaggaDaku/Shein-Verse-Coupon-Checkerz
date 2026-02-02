@@ -1,16 +1,20 @@
 import os, time, re, threading, requests, urllib3
 from flask import Flask, render_template_string, request, jsonify, session, redirect
+from functools import wraps
 
-urllib3.disable_warnings()
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
-app.secret_key = "9fH7@Kq2!M#8Zp$E6vW0xR3L^D*SaB"
+
+# ================== SECURITY ==================
+app.secret_key = "x8Q@92LkP#E!4zM7$A^fW3R&dT5J"  # strong secret
 
 APP_USERNAME = "Admin"
 APP_PASSWORD = "Aezakmi"
 
 AUTO_PROTECT_INTERVAL = 300  # 5 minutes
 
+# ================== STATE ==================
 class AppState:
     def __init__(self):
         self.is_running = False
@@ -29,8 +33,7 @@ class AppState:
 state = AppState()
 lock = threading.RLock()
 
-# ================= Helpers =================
-
+# ================== HELPERS ==================
 def add_log(msg):
     with lock:
         state.log.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -41,44 +44,63 @@ def extract_vouchers(text):
     return list(dict.fromkeys(re.findall(r"[A-Z0-9]{4,30}", text.upper())))
 
 def extract_cookies(text):
-    return text.split(":",1)[1].strip() if "cookie:" in text.lower() else text.strip()
+    if "cookie:" in text.lower():
+        return text.split(":",1)[1].strip()
+    return text.strip()
+
+def make_headers(cookie):
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "Origin": "https://www.sheinindia.in",
+        "Referer": "https://www.sheinindia.in/cart",
+        "Cookie": cookie
+    }
 
 def check_single_voucher(session_http, code, headers):
     url = "https://www.sheinindia.in/api/cart/apply-voucher"
     reset_url = "https://www.sheinindia.in/api/cart/reset-voucher"
     payload = {"voucherId": code, "device": {"client_type": "web"}}
+
     try:
         r = session_http.post(url, json=payload, headers=headers, timeout=15, verify=False)
-        if r.status_code in (403,429):
-            return False, "Rate Limited / Blocked", 0
+
+        if r.status_code in (403, 429):
+            return False, "Blocked / Cloudflare", 0
+
         if r.status_code != 200:
-            return False, "HTTP Error", 0
+            return False, f"HTTP {r.status_code}", 0
+
         data = r.json()
+
         for v in data.get("appliedVouchers", []):
             if v.get("code") == code:
                 val = v.get("appliedValue", {}).get("value", 0)
                 session_http.post(reset_url, json={"voucherId": code}, headers=headers, timeout=10, verify=False)
-                return True, "Valid", val
-        return False, "Invalid", 0
+                return True, "VALID", val
+
+        return False, "INVALID", 0
+
     except Exception as e:
         return False, str(e), 0
 
-# ================= Worker =================
-
+# ================== WORKER ==================
 def worker_loop():
     while not state.stop_requested:
         session_http = requests.Session()
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Content-Type": "application/json",
-            "Cookie": state.cookies
-        }
+        headers = make_headers(state.cookies)
 
         for code in state.vouchers:
             if state.stop_requested:
                 break
-            state.status = f"Checking {code}"
+
+            with lock:
+                state.status = f"Checking {code}"
+
             ok, msg, discount = check_single_voucher(session_http, code, headers)
+
             with lock:
                 state.checked += 1
                 if ok:
@@ -87,52 +109,58 @@ def worker_loop():
                 else:
                     state.invalid += 1
                     state.invalid_results.insert(0, {"code": code, "msg": msg})
+
                 add_log(f"{code} => {msg}")
+
             time.sleep(1)
 
         if not state.auto_protect:
             break
 
-        state.status = "Sleeping (Auto Protect Mode)"
-        add_log("Auto Protect: Waiting next cycle")
+        with lock:
+            state.status = "Sleeping (Auto Protect Mode)"
+            add_log("Auto Protect: Waiting next cycle")
+
         for _ in range(AUTO_PROTECT_INTERVAL):
             if state.stop_requested:
                 break
             time.sleep(1)
 
-    state.is_running = False
-    state.status = "Stopped"
+    with lock:
+        state.is_running = False
+        state.status = "Stopped"
 
-# ================= Auth =================
-
+# ================== AUTH ==================
 def login_required(fn):
-    def wrap(*a,**k):
+    @wraps(fn)
+    def wrapper(*a, **k):
         if not session.get("logged_in"):
             return redirect("/login")
-        return fn(*a,**k)
-    wrap.__name__ = fn.__name__
-    return wrap
+        return fn(*a, **k)
+    return wrapper
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    if request.method=="POST":
-        if request.form["username"]==APP_USERNAME and request.form["password"]==APP_PASSWORD:
-            session["logged_in"]=True
+    if request.method == "POST":
+        if request.form.get("username") == APP_USERNAME and request.form.get("password") == APP_PASSWORD:
+            session["logged_in"] = True
             return redirect("/")
-        return "Invalid Login"
-    return """<form method=post>
-    <h2>Login</h2>
-    <input name=username><br><br>
-    <input type=password name=password><br><br>
-    <button>Login</button></form>"""
+        return "<h3>Invalid Login</h3>"
+    return """
+    <h2>Secure Login</h2>
+    <form method="post">
+    <input name="username" placeholder="Username"><br><br>
+    <input type="password" name="password" placeholder="Password"><br><br>
+    <button>Login</button>
+    </form>
+    """
 
 @app.route("/logout")
 def logout():
     session.clear()
     return redirect("/login")
 
-# ================= Routes =================
-
+# ================== ROUTES ==================
 @app.route("/")
 @login_required
 def index():
@@ -141,45 +169,50 @@ def index():
 @app.route("/start", methods=["POST"])
 @login_required
 def start():
-    data=request.json
-    state.cookies=extract_cookies(data.get("cookies",""))
-    state.vouchers=extract_vouchers(data.get("vouchers",""))
-    state.auto_protect=data.get("auto_protect",False)
+    data = request.json or {}
 
-    if not state.cookies or not state.vouchers:
-        return jsonify({"error":"Missing cookies or vouchers"}),400
+    with lock:
+        state.cookies = extract_cookies(data.get("cookies",""))
+        state.vouchers = extract_vouchers(data.get("vouchers",""))
+        state.auto_protect = data.get("auto_protect", False)
 
-    state.checked=state.valid=state.invalid=0
-    state.valid_results.clear()
-    state.invalid_results.clear()
-    state.stop_requested=False
-    state.is_running=True
-    threading.Thread(target=worker_loop,daemon=True).start()
+        if not state.cookies or not state.vouchers:
+            return jsonify({"error":"Missing cookies or vouchers"}),400
+
+        state.checked = state.valid = state.invalid = 0
+        state.valid_results.clear()
+        state.invalid_results.clear()
+        state.stop_requested = False
+        state.is_running = True
+        state.status = "Starting..."
+
+    threading.Thread(target=worker_loop, daemon=True).start()
     return jsonify({"success":True})
 
-@app.route("/stop",methods=["POST"])
+@app.route("/stop", methods=["POST"])
 @login_required
 def stop():
-    state.stop_requested=True
-    state.status="Stopping"
+    with lock:
+        state.stop_requested = True
+        state.status = "Stopping"
     return jsonify({"success":True})
 
 @app.route("/status")
 @login_required
 def status():
-    return jsonify({
-        "running":state.is_running,
-        "status":state.status,
-        "checked":state.checked,
-        "valid":state.valid,
-        "invalid":state.invalid,
-        "valid_results":state.valid_results[:20],
-        "invalid_results":state.invalid_results[:20],
-        "log":state.log[-10:]
-    })
+    with lock:
+        return jsonify({
+            "running": state.is_running,
+            "status": state.status,
+            "checked": state.checked,
+            "valid": state.valid,
+            "invalid": state.invalid,
+            "valid_results": state.valid_results[:20],
+            "invalid_results": state.invalid_results[:20],
+            "log": state.log[-10:]
+        })
 
-# ================= Premium UI =================
-
+# ================== PREMIUM UI ==================
 HTML = """
 <!DOCTYPE html>
 <html>
@@ -221,8 +254,7 @@ out.textContent=JSON.stringify(d,null,2)
 </html>
 """
 
-# ================= Main =================
-
-if __name__=="__main__":
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0",port=port)
+# ================== MAIN ==================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
